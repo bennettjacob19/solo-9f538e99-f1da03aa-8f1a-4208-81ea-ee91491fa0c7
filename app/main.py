@@ -1,10 +1,12 @@
 """FastAPI 入口：cgroup v2 批处理作业 SIGKILL 归因诊断。
 
 用法（/docs 交互式）：
-  1. GET  /status            看内存上限是否生效、单轮上限多少 MiB
-  2. POST /jobs              填 memory_mib 启动样例作业（最多两轮并行）
-  3. POST /jobs/{id}/stop    凭作业号强停（SIGKILL）
-  4. GET  /jobs/{id}         查退出状态、oom_kill 前后读数与归因结论
+  1. GET  /status                   看内存上限、总额度/剩余额度、槽位占用
+  2. POST /jobs                     填 memory_mib 启动样例作业，可另填本轮
+                                    内存上限 memory_limit_mib（整数 MiB，>=48，
+                                    省略则用默认均分值）
+  3. POST /jobs/{id}/stop           凭作业号强停（SIGKILL）
+  4. GET  /jobs/{id}                查退出状态、本轮生效上限、oom_kill 读数与归因
 """
 from __future__ import annotations
 
@@ -16,7 +18,13 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
 from .cgroups import CgroupV2Backend, SimulatedBackend
-from .jobs import JobManager, NoSlotAvailable, NotAccepting
+from .jobs import (
+    JobManager,
+    LimitSetupFailed,
+    NoSlotAvailable,
+    NotAccepting,
+    QuotaExceeded,
+)
 
 
 def _build_manager() -> JobManager:
@@ -41,12 +49,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="cgroup v2 SIGKILL 归因诊断",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "批处理子进程被 SIGKILL 时，区分 **OOM（oom_kill）** 与 **主动强停（force_stopped）**，"
         "另可判 **正常退出（normal_exit）**；证据缺失或冲突时报 **原因不明（unknown）**。"
-        "每轮作业跑在独立 cgroup，凭本轮 memory.events 的 oom_kill 前后读数归因；"
-        "上一轮给出结论后其槽位才交给下一轮。"
+        "每轮作业跑在独立 cgroup，启动前按本轮请求设置 memory.max，凭本轮 memory.events 的 "
+        "oom_kill 前后读数归因；容器上限扣服务预留为总额度，正在设置上限或未出归因的作业"
+        "均按各自上限占额，额度或槽位不足返回 409。"
     ),
     lifespan=lifespan,
 )
@@ -59,8 +68,18 @@ def _mgr(request: Request) -> JobManager:
 class StartJobIn(BaseModel):
     memory_mib: int = Field(
         ..., ge=1, le=1024 * 1024,
-        description="样例作业要实际占用的目标内存（MiB）。超过 /status 里的单轮上限即触发 OOM",
+        description="样例作业要实际占用的目标内存（MiB）。超过本轮生效上限即触发 OOM",
         examples=[160],
+    )
+    memory_limit_mib: int | None = Field(
+        default=None,
+        ge=48,
+        description=(
+            "本轮内存上限（整数 MiB，至少 48）。省略则用默认值"
+            "（容器上限扣预留后的总额度按槽位均分）。"
+            "受总额度约束：所有在跑/设置中的轮次上限之和不得超过总额度，否则 409。"
+        ),
+        examples=[128],
     )
     hold_seconds: float = Field(
         30, ge=1, le=3600,
@@ -75,7 +94,7 @@ def root():
 
 @app.get("/status", tags=["诊断"])
 def status(request: Request):
-    """内存上限是否生效、当前是否接作业、槽位占用情况。"""
+    """内存上限是否生效、总额度与剩余额度、当前槽位占用情况。"""
     mgr = _mgr(request)
     st = mgr.status
     return {
@@ -87,9 +106,19 @@ def status(request: Request):
         "memory_limit_bytes": st.memory_limit_bytes,
         "memory_limit_mib": st.memory_limit_bytes // (1024 * 1024) if st.memory_limit_bytes else None,
         "memory_current_bytes": st.memory_current_bytes,
+        "reserve_mib": st.reserve_bytes // (1024 * 1024) if st.reserve_bytes is not None else None,
+        "quota_total_mib": st.quota_total_bytes // (1024 * 1024)
+        if st.quota_total_bytes is not None else None,
         "slots": mgr.slots_snapshot(),
-        "how_to": "POST /jobs 起作业（memory_mib 超单轮上限即 OOM）；"
-                  "POST /jobs/{job_id}/stop 强停；GET /jobs/{job_id} 查归因",
+        "simulation": {
+            "set_delay_seconds": st.set_delay_seconds,
+            "fail_limit_mib": st.fail_limit_mib,
+        } if st.mode == "simulation" else None,
+        "how_to": (
+            "POST /jobs 起作业：memory_mib 超本轮生效上限即 OOM；"
+            "可另填 memory_limit_mib（>=48MiB，省略用默认均分上限）指定本轮上限；"
+            "POST /jobs/{job_id}/stop 强停；GET /jobs/{job_id} 查归因与生效上限"
+        ),
     }
 
 
@@ -98,7 +127,8 @@ async def start_job(body: StartJobIn, request: Request):
     """启动一轮样例作业：实际占用 memory_mib MiB 内存并保持 hold_seconds 秒。
 
     - 503：内存上限未生效 / cgroup 不可用（按规则不接作业）
-    - 409：两轮槽位都在跑，等上一轮出归因结论后再试
+    - 409：槽位占满，或本轮上限超过剩余额度（均不扣任何资源）
+    - 500：本轮 cgroup 上限设置失败（已自动退回本轮槽位与额度）
     """
     mgr = _mgr(request)
     if not mgr.status.accepting:
@@ -110,13 +140,37 @@ async def start_job(body: StartJobIn, request: Request):
             },
         )
     try:
-        job = await mgr.start(body.memory_mib, body.hold_seconds)
+        job = await mgr.start(
+            memory_mib=body.memory_mib,
+            hold_seconds=body.hold_seconds,
+            memory_limit_mib=body.memory_limit_mib,
+        )
     except NotAccepting:
         raise HTTPException(status_code=503, detail="当前不接作业")
     except NoSlotAvailable:
         raise HTTPException(
             status_code=409,
-            detail="两轮作业槽位均在占用中；上一轮给出归因结论后槽位才会交还",
+            detail="作业槽位均在占用中（含正在设置上限的轮次）；上一轮给出归因结论后槽位才会交还",
+        )
+    except QuotaExceeded as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "内存额度不足，拒绝接单（未占用槽位与额度）",
+                "message": str(exc),
+                "requested_mib": exc.requested_bytes // (1024 * 1024),
+                "quota_total_mib": exc.total_bytes // (1024 * 1024),
+                "quota_used_mib": exc.used_bytes // (1024 * 1024),
+                "quota_free_mib": (exc.total_bytes - exc.used_bytes) // (1024 * 1024),
+            },
+        )
+    except LimitSetupFailed as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "本轮 cgroup 内存上限设置失败，已退回本轮槽位与额度，可重试",
+                "reason": exc.reason,
+            },
         )
     return job.to_dict()
 
@@ -129,7 +183,7 @@ def list_jobs(request: Request):
 
 @app.get("/jobs/{job_id}", tags=["诊断"])
 def get_job(job_id: str, request: Request):
-    """凭作业号查结果：退出状态、oom_kill 前后读数、归因结论。"""
+    """凭作业号查结果：本轮生效上限、退出状态、oom_kill 前后读数、归因结论。"""
     job = _mgr(request).get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"未知作业号 {job_id}")

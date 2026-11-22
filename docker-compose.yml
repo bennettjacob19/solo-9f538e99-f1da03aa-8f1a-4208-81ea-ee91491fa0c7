@@ -1,4 +1,6 @@
 services:
+  # 真实后端：要求 cgroup v2 宿主机 + Docker >= 20.10（默认 private cgroup
+  # 命名空间，容器内 /sys/fs/cgroup 可写；不依赖 privileged）
   oom-doctor:
     build: .
     image: gsb-oom-doctor
@@ -11,16 +13,38 @@ services:
     environment:
       GSB_SLOTS: "2"          # 并行轮数（槽位数）
       GSB_RESERVE_MIB: "96"   # 给 API 进程自身预留的内存
-    # 要求：cgroup v2 宿主机 + Docker >= 20.10（默认 private cgroup 命名空间，
-    # 容器内 /sys/fs/cgroup 可写）。老版本 Docker 若挂载为只读，需升级或
-    # 以 --cgroupns=private 运行；本仓库不依赖 privileged。
+    # 老版本 Docker 若把 cgroup 挂载为只读，需升级或以 --cgroupns=private 运行
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/status')"]
       interval: 10s
       timeout: 3s
       retries: 5
 
-  # 一键自测：docker compose run --rm selftest
+  # 模拟后端：宿主没有可写 cgroup（如本机/CI/只读 cgroup 环境）时，
+  # 用普通目录模拟 memory.max/memory.events，演示同一套接单/额度/回退流程。
+  # OOM 由样例作业按本轮限制自查复现；默认每轮设置上限耗时 0.5s，可在此调。
+  # 启动：docker compose --profile simulate up oom-doctor-sim
+  oom-doctor-sim:
+    image: gsb-oom-doctor
+    build: .
+    profiles: ["simulate"]
+    ports:
+      - "8000:8000"
+    environment:
+      GSB_SIMULATE: "1"
+      GSB_SIM_LIMIT_MIB: "256"          # 模拟容器内存上限
+      GSB_RESERVE_MIB: "96"             # 预留 -> 总额度 160MiB
+      GSB_SLOTS: "2"
+      GSB_SIM_SET_DELAY_SECONDS: "0.5"  # 模拟设置 cgroup 上限的耗时
+      # 演示设置失败回退时取消下一行注释（请求 50MiB 上限即注入一次失败）
+      # GSB_SIM_FAIL_LIMIT_MIB: "50"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/status')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # 一键自测（真实后端）：docker compose run --rm selftest
   selftest:
     image: gsb-oom-doctor
     build: .
@@ -28,3 +52,12 @@ services:
     depends_on:
       - oom-doctor
     command: ["python3", "scripts/selftest.py", "--base-url", "http://oom-doctor:8000"]
+
+  # 一键自测（模拟后端）：
+  #   docker compose --profile simulate run --rm selftest-sim
+  selftest-sim:
+    image: gsb-oom-doctor
+    profiles: ["selftest", "simulate"]
+    depends_on:
+      - oom-doctor-sim
+    command: ["python3", "scripts/selftest.py", "--base-url", "http://oom-doctor-sim:8000"]
