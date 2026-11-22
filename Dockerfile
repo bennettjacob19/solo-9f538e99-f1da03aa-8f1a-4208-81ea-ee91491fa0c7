@@ -1,0 +1,17 @@
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /srv
+
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+COPY app ./app
+COPY scripts ./scripts
+
+EXPOSE 8000
+
+# 单 worker 即可：作业状态在进程内存中，多 worker 会各持一份
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -1,0 +1,30 @@
+services:
+  oom-doctor:
+    build: .
+    image: gsb-oom-doctor
+    ports:
+      - "8000:8000"
+    # 关键：内存上限生效，API 才接作业（cgroup v2 下 docker 会写 memory.max）
+    mem_limit: 384m
+    # 等值设置 = 禁用 swap，保证超限即 OOM 而不是换页拖慢
+    memswap_limit: 384m
+    environment:
+      GSB_SLOTS: "2"          # 并行轮数（槽位数）
+      GSB_RESERVE_MIB: "96"   # 给 API 进程自身预留的内存
+    # 要求：cgroup v2 宿主机 + Docker >= 20.10（默认 private cgroup 命名空间，
+    # 容器内 /sys/fs/cgroup 可写）。老版本 Docker 若挂载为只读，需升级或
+    # 以 --cgroupns=private 运行；本仓库不依赖 privileged。
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/status')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # 一键自测：docker compose run --rm selftest
+  selftest:
+    image: gsb-oom-doctor
+    build: .
+    profiles: ["selftest"]
+    depends_on:
+      - oom-doctor
+    command: ["python3", "scripts/selftest.py", "--base-url", "http://oom-doctor:8000"]
